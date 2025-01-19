@@ -3,6 +3,8 @@ import time  # Модуль для работы со временем
 import random  # Модуль для генерации случайных чисел
 import logging  # Модуль для логирования событий
 import threading  # Модуль для работы с потоками
+from urllib.parse import uses_relative
+
 import pandas as pd # Модуль для работы с данными в виде таблиц
 import matplotlib   # Модуль для построения графиков
 matplotlib.use('Agg')    # Использование бэкэнда 'Agg' для работы без отображения окон
@@ -45,11 +47,14 @@ class Task:
     priority: int  # Приоритет задачи
     id: int  # Уникальный идентификатор задачи
     data_size: int  # Размер данных в битах
+    memory_size: int = field(default=0)  # Размер памяти, используемой задачей, в байтах
     type: TaskType = TaskType.COMPUTE  # Тип задачи, по умолчанию COMPUTE
     operations: int = field(default=0)  # Количество операций, необходимых для выполнения задачи
     processor: Optional[int] = field(default=None, compare=False)  # Идентификатор процессора, на котором выполняется задача
     cluster: Optional[int] = field(default=None, compare=False)  # Идентификатор кластера внутри процессора
     core: Optional[int] = field(default=None, compare=False)  # Идентификатор ядра внутри кластера
+    cluster_central: Optional[int] = field(default=None, compare=False)  # Идентификатор кластера внутри процессора
+    core_central: Optional[int] = field(default=None, compare=False)  # Идентификатор ядра внутри кластера
     state: TaskState = field(default=TaskState.PENDING, compare=False)  # Текущее состояние задачи, по умолчанию PENDING
     execution_time: float = field(default=0.0, compare=False)  # Время выполнения задачи в секундах
     time_added: float = field(default=0.0, compare=False)  # Время добавления задачи в очередь
@@ -68,6 +73,30 @@ class Task:
         # Метод для проверки равенства задач по приоритету
         return self.priority == other.priority
 
+class RAM:
+    def __init__(self, total_memory_size: int):
+        self.total_memory_size = total_memory_size  # Общий размер памяти в байтах
+        self.used_memory = 0  # Используемая память
+        self.free_memory = total_memory_size - self.used_memory
+        self.memory_map = {}  # Карта памяти, где ключ — ID задачи, значение — объём занятой памяти
+
+    def allocate(self, task: Task) -> bool:
+        """Выделяет память для задачи"""
+        if self.used_memory + task.memory_size <= self.total_memory_size:
+            self.memory_map[task.id] = task.memory_size  # Помечаем память как занятую
+            self.used_memory += task.memory_size
+            self.free_memory -= task.memory_size
+            return True
+        return False  # Недостаточно памяти
+
+    def release(self, task: Task):
+        """Освобождает память для задачи"""
+        if task.id in self.memory_map:
+            self.used_memory -= self.memory_map[task.id]
+            self.free_memory += self.memory_map[task.id]
+            del self.memory_map[task.id]  # Удаляем задачу из карты памяти
+
+
 # Определение класса для процессора
 class RISCVProcessor:
     def __init__(self, processor_id):
@@ -82,7 +111,7 @@ class RISCVProcessor:
         self.task_history = []  # История выполненных задач
         self.logger = logging.getLogger(f"Processor-{processor_id}")  # Логгер для процессора
         # Определяем множители времени жизни для каждого приоритета
-        self.priority_multiplier_map = {
+        self. priority_multiplier_map = {
             1: 1.5,  # Приоритет 1: 1.5 × execution_time
             2: 2.0,  # Приоритет 2: 2.0 × execution_time
             3: 2.5,  # Приоритет 3: 2.5 × execution_time
@@ -117,6 +146,27 @@ class RISCVProcessor:
                         return (task.cluster, task.core)  # Возвращаем кортеж с идентификаторами кластера и ядра
         return None  # Возвращаем None, если свободных ядер нет
 
+    def allocate_core_central(self, task: Task) -> Optional[tuple]:
+        """
+        Попытка выделить свободное ядро для сохранения задачи.
+        Если успешна, обновляет статус ядра и возвращает кортеж (cluster, core).
+        Если нет свободных ядер, возвращает None.
+        """
+        # Блокируем доступ к ядрам для предотвращения одновременной попытки использования ядра разными потоками
+        with self.core_lock:
+            for cluster in range(self.clusters):  # Проходим по всем кластерам
+                for core in range(self.cores_per_cluster):  # Проходим по всем ядрам в кластере
+                    if self.core_status[cluster][core]:  # Если ядро свободно
+                        self.core_status[cluster][core] = False  # Помечаем ядро как занятое
+                        task.core_central = core + 1  # Присваиваем задаче идентификатор ядра (начиная с 1)
+                        task.cluster_central = cluster + 1 # Присваиваем задаче идентификатор кластера (начиная с 1)
+                        # Логируем информацию о выделении ядра
+                        self.logger.debug(
+                            f"Allocated Task {task.id} to Cluster {task.cluster}, Core {task.core}"
+                            f" with execution time {task.execution_time:.6f} сек and max_lifetime {task.max_lifetime:.6f} сек")
+                        return (task.cluster, task.core)  # Возвращаем кортеж с идентификаторами кластера и ядра
+        return None  # Возвращаем None, если свободных ядер нет
+
     def calculate_execution_time(self, task: Task) -> float:
         """
         Рассчитывает время выполнения задачи на основе количества тактов, объему данных и частоты процессора.
@@ -135,13 +185,13 @@ class RISCVProcessor:
             self.logger.debug(f"Released Cluster {cluster}, Core {core}")  # Логируем освобождение ядра
 
 class MultiprocessorRTOS:
-    def __init__(self, amount_of_processors):
+    def __init__(self, amount_of_processors, ddr_size):
         """
         Инициализирует RTOS с заданной конфигурацией процессоров.
         """
         # Создаём процессор, выполняющий роль управляющего устройства
         self.central_processor = RISCVProcessor('central')
-
+        self.ram = RAM(ddr_size)
         # Создаём словарь процессоров, индексированных по их номеру (начиная с 1)
         self.processors = {
             idx + 1: RISCVProcessor(idx + 1)  # Идентификаторы процессоров начинаются с 1
@@ -191,6 +241,60 @@ class MultiprocessorRTOS:
         self.logger.debug(f"No available cores for Task {task.id} on any processor")  # Логируем отсутствие доступных ядер
         return None  # Возвращаем None
 
+    def send_task_to_central(self, task: Task):
+        core_allocation = self.central_processor.allocate_core_central(task)
+        if core_allocation:
+
+            self.logger.info(f"Начата передача задачи {task.id} на Центральный Процессор")
+            cluster, core = core_allocation
+            time.sleep(task.transfer_time)  # Моделируем время передачи
+            self.logger.info(f"Завершена передача задачи {task.id} на Центральный Процессор ")
+
+            # Создаём новый поток для выполнения задачи
+            thread = threading.Thread(target=self._save_task, args=(task, cluster, core))
+            thread.start()  # Запускаем поток
+            self.threads.append(thread)  # Добавляем поток в список активных потоков
+        else:
+            # Если не удалось выделить ядро, возвращаем задачу обратно в очередь
+            self.logger.debug(
+                f"Нет доступных ядер для задачи {task.id} на центральном процессоре, ожидаем")
+            time.sleep(0.1)
+            self.send_task_to_central(task)
+
+
+
+    def _save_task(self, task: Task,  cluster: int, core: int):
+        """
+        Симуляция выполнения задачи в процессоре.
+        """
+        self.logger.info(f"Отправка задачи {task.id} с Центрального Процессора, Кластер {cluster}, Ядро {core} в память")
+
+        time.sleep(task.transfer_time/4)  # Моделирование времени выполнения задачи
+
+        # Освобождаем ядро после завершения задачи
+        self.central_processor.release_core(cluster, core)
+        task.state = TaskState.COMPLETED  # Обновляем состояние задачи на COMPLETED
+
+        # Добавляем информацию о завершённой задаче в список завершённых задач
+        with self.completed_lock:  # Блокируем доступ к списку завершённых задач
+            self.completed_tasks.append({
+                "task_id": task.id,
+                "processor": task.processor,
+                "cluster": task.cluster,
+                "core": task.core,
+                "type": task.type.name,
+                "priority": task.priority,
+                "execution_time": task.execution_time,
+                "transfer_time": task.transfer_time,
+                "waiting_time": task.waiting_time,
+                "data_size": task.data_size,
+                "state": task.state.name,
+                "time_completed": task.time_completed,
+                "max_lifetime": task.max_lifetime
+            })
+
+
+
     def send_task(self, task: Task, processor: RISCVProcessor):
         """
         Моделирует отправку задачи на выбранный процессор через центральный процессор.
@@ -201,29 +305,35 @@ class MultiprocessorRTOS:
             """
             # Пытаемся выделить ядро на целевом процессоре
             core_allocation = processor.allocate_core(task)
-            if core_allocation:  # Если удалось выделить ядро
-                with self.processing_lock:
-                    self.transferring_tasks.append(task)  # Добавляем задачу в список передаваемых
-                self.logger.info(f"Начата передача задачи {task.id} на Процессор {processor.id}")
-                cluster, core = core_allocation
-                time.sleep(task.transfer_time)  # Моделируем время передачи
-                self.logger.info(f"Завершена передача задачи {task.id} на Процессор {processor.id} ")
-                self.logger.debug(
-                    f"Создание потока для задачи {task.id} на Процессоре {processor.id}, Кластер {cluster}, Ядро {core}")
-                # Создаём новый поток для выполнения задачи
-                thread = threading.Thread(target=self._execute_task, args=(task, processor, cluster, core))
-                thread.start()  # Запускаем поток
-                task.time_started = time.time()  # Фиксируем время начала выполнения задачи
-                task.waiting_time = task.time_started - task.time_added  # Вычисляем длительность нахождения задачи в очереди
-                with self.processing_lock:
-                    self.executing_tasks.append(task)   # Добавляем задачу в список выполняющихся
-                self.threads.append(thread)  # Добавляем поток в список активных потоков
+            if self.ram.free_memory - task.memory_size >= 0 :
+                self.ram.allocate(task)
+                if core_allocation:  # Если удалось выделить ядро
+                    with self.processing_lock:
+                        self.transferring_tasks.append(task)  # Добавляем задачу в список передаваемых
+                    self.logger.info(f"Начата передача задачи {task.id} на Процессор {processor.id}")
+                    cluster, core = core_allocation
+                    time.sleep(task.transfer_time)  # Моделируем время передачи
+                    self.logger.info(f"Завершена передача задачи {task.id} на Процессор {processor.id} ")
+                    self.logger.debug(
+                        f"Создание потока для задачи {task.id} на Процессоре {processor.id}, Кластер {cluster}, Ядро {core}")
+                    # Создаём новый поток для выполнения задачи
+                    thread = threading.Thread(target=self._execute_task, args=(task, processor, cluster, core))
+                    thread.start()  # Запускаем поток
+                    task.time_started = time.time()  # Фиксируем время начала выполнения задачи
+                    task.waiting_time = task.time_started - task.time_added  # Вычисляем длительность нахождения задачи в очереди
+                    with self.processing_lock:
+                        self.executing_tasks.append(task)   # Добавляем задачу в список выполняющихся
+                    self.threads.append(thread)  # Добавляем поток в список активных потоков
+                else:
+                    # Если не удалось выделить ядро, возвращаем задачу обратно в очередь
+                    self.logger.debug(
+                        f"Нет доступных ядер для задачи {task.id} на Процессоре {processor.id}, возвращаем в очередь")
+                    self.add_task(task) # Возвращаем задачу в очередь
+                self.ram.release(task)
             else:
-                # Если не удалось выделить ядро, возвращаем задачу обратно в очередь
-                self.logger.debug(
-                    f"Нет доступных ядер для задачи {task.id} на Процессоре {processor.id}, возвращаем в очередь")
-                self.add_task(task) # Возвращаем задачу в очередь
-
+                self.logger.info(
+                    f"Not enough memory for Task {task.id} on Processor {processor.id}, returning to queue")
+                self.add_task(task)  # Возвращаем задачу в очередь
             # Освобождаем ядро главного процессора после передачи
             cluster_cp, core_cp = central_core
             self.central_processor.release_core(cluster_cp, core_cp)
@@ -265,7 +375,7 @@ class MultiprocessorRTOS:
                 task.execution_time = self.central_processor.calculate_execution_time(task) # Определяем время выполнения
                 multiplier = self.central_processor.priority_multiplier_map.get(task.priority, 2.0) # Множитель для времени жизни
                 task.max_lifetime = multiplier * task.execution_time    # Установка времени жизни задачи
-                if task.max_lifetime < 0.5 : task.max_lifetime = 0.5
+                if task.max_lifetime < 0.9 : task.max_lifetime = 0.9
             if waiting_time > task.max_lifetime:
                 # Время выполнения задачи превышает max_lifetime и должна быть удалена
                 self.logger.info(
@@ -289,7 +399,7 @@ class MultiprocessorRTOS:
                     })
                 continue  # Переходим к следующей задаче
             # Расчет времени пересылки данных
-            transfer_rate = 128e9  # Скорость передачи данных 128 Гбит/с
+            transfer_rate = 32e9  # Скорость передачи данных 128 Гбит/с
             task.transfer_time = task.data_size / transfer_rate  # Время пересылки в секундах
             processor = self._select_processor(task)  # Выбираем процессор для выполнения задачи
             if processor:  # Если процессор выделен
@@ -317,27 +427,28 @@ class MultiprocessorRTOS:
         task.time_completed = time.time()
         # Рассчитываем время обработки задачи как время ожидания + время выполнения
         task.lifetime = task.time_completed - task.time_added
+        self.send_task_to_central(task)
         # Освобождаем ядро после завершения задачи
         processor.release_core(cluster, core)
         task.state = TaskState.COMPLETED  # Обновляем состояние задачи на COMPLETED
 
-        # Добавляем информацию о завершённой задаче в список завершённых задач
-        with self.completed_lock:  # Блокируем доступ к списку завершённых задач
-            self.completed_tasks.append({
-                "task_id": task.id,
-                "processor": processor.id,
-                "cluster": cluster,
-                "core": core,
-                "type": task.type.name,
-                "priority": task.priority,
-                "execution_time": task.execution_time,
-                "transfer_time": task.transfer_time,
-                "waiting_time": task.waiting_time,
-                "data_size": task.data_size,
-                "state": task.state.name,
-                "time_completed": task.time_completed,
-                "max_lifetime": task.max_lifetime
-            })
+        # # Добавляем информацию о завершённой задаче в список завершённых задач
+        # with self.completed_lock:  # Блокируем доступ к списку завершённых задач
+        #     self.completed_tasks.append({
+        #         "task_id": task.id,
+        #         "processor": processor.id,
+        #         "cluster": cluster,
+        #         "core": core,
+        #         "type": task.type.name,
+        #         "priority": task.priority,
+        #         "execution_time": task.execution_time,
+        #         "transfer_time": task.transfer_time,
+        #         "waiting_time": task.waiting_time,
+        #         "data_size": task.data_size,
+        #         "state": task.state.name,
+        #         "time_completed": task.time_completed,
+        #         "max_lifetime": task.max_lifetime
+        #     })
         # Удаляем задачу из списка выполняющихся
         with self.processing_lock:
             self.executing_tasks.remove(task)
@@ -359,6 +470,7 @@ def generate_ieee_802_3ba_tasks(count=500, min_size=64, max_size=128):
     for i in range(count):
         task_type = random.choice(list(TaskType))  # Случайный выбор типа задачи
         data_size = random.randint(min_size, max_size)  # Размер данных в битах (случайный из диапазона)
+        memory_size = data_size // 8
         # Определяем количество операций на основе размера данных и типа задачи
         # Предполагаем, что одна операция обрабатывает 1 бит данных
         ops = max(1, data_size // 64)
@@ -368,6 +480,7 @@ def generate_ieee_802_3ba_tasks(count=500, min_size=64, max_size=128):
             data_size=data_size,
             type=task_type,
             operations=ops,
+            memory_size= memory_size
         )
         tasks.append(task)  # Добавляем задачу в список
     return tasks  # Возвращаем список задач
@@ -436,6 +549,70 @@ def generate_processor_task_distribution(df):
     plt.close()
 
 
+def generate_processor_task_distribution_with_types(df):
+    """
+    Генерирует гистограмму, показывающую количество задач, обработанных каждым процессором,
+    с выделением типов задач разными цветами.
+    """
+    # Фильтруем только выполненные задачи
+    completed_tasks = df[df['Состояние'] == 'COMPLETED']
+
+    # Проверяем наличие пропущенных значений
+    if completed_tasks[['Процессор', 'Тип']].isnull().any().any():
+        print("Предупреждение: в данных присутствуют пропущенные значения.")
+        completed_tasks = completed_tasks.dropna(subset=['Процессор', 'Тип'])
+
+    # Считаем количество задач по каждому процессору и типу задачи
+    processor_task_types = completed_tasks.groupby(['Процессор', 'Тип']).size().unstack(fill_value=0)
+
+    # Создаем фигуру для гистограммы
+    plt.figure(figsize=(12, 8))
+
+    # Строим stack bar plot (столбчатую диаграмму с накоплением)
+    ax = processor_task_types.plot(kind='bar', stacked=True, colormap='Set2', figsize=(12, 8))
+
+    plt.title('Количество Задач, Обработанных Каждым Процессором\nпо Типам Задач')
+    plt.xlabel('Процессор')
+    plt.ylabel('Количество Задач')
+
+
+
+    # Добавляем легенду для типов задач
+    plt.legend(title="Типы Задач", bbox_to_anchor=(1.05, 1), loc='upper left')
+
+    plt.tight_layout()
+    plt.savefig('processor_task_distribution_by_type.png')
+    plt.close()
+    print("Гистограмма сохранена как 'processor_task_distribution_by_type.png'.")
+
+
+# Пример использования с генерацией тестовых данных
+def generate_test_data(count=500):
+    """
+    Генерирует тестовые данные задач с различными типами для демонстрации.
+    """
+    task_types = ['typeA', 'typeB', 'typeC']
+    processors = ['CPU1', 'CPU2', 'CPU3']
+
+    data = []
+    for i in range(count):
+        task = {
+            'id': i + 1,
+            'Состояние': random.choice(['COMPLETED', 'DROPPED']),
+            'Процессор': random.choice(processors),
+            'Тип': random.choice(task_types)
+        }
+        data.append(task)
+
+    return pd.DataFrame(data)
+
+
+# Генерация тестовых данных
+df = generate_test_data(count=500)
+
+# Генерация гистограммы с распределением типов задач по процессорам
+generate_processor_task_distribution(df)
+
 def generate_core_task_distribution(df):
     """
     Генерирует тепловые карты распределения задач между ядрами на каждом процессоре.
@@ -481,6 +658,45 @@ def generate_core_task_distribution(df):
         plt.close()
         print(f"График распределения задач по ядрам для Процессора {processor} сохранён как {filename}")
 
+
+def process_tasks_for_frames(df, max_frame_size=1500):
+    """
+    Обрабатывает задачи, делит их на кадры и возвращает статистику о заполненности кадров.
+    """
+    frames_info = []
+
+    # Фильтруем только завершенные задачи
+    completed_tasks = df[df['Состояние'] == 'COMPLETED']
+
+    for _, task in completed_tasks.iterrows():
+        remaining_data = task['Размер (бит)'] /8 # Размер данных задачи в битах
+        while remaining_data > 0:
+            # Определяем размер текущего кадра
+            frame_data_size = min(remaining_data, max_frame_size)
+            remaining_data -= frame_data_size
+
+            # Процент заполненности кадра
+            fill_percentage = (frame_data_size / max_frame_size) * 100
+            frames_info.append(fill_percentage)
+
+    return frames_info
+
+
+def generate_fill_percentage_histogram(frames_info):
+    """
+    Генерирует гистограмму, показывающую на сколько процентов заполнены кадры.
+    """
+    plt.figure(figsize=(10, 6))
+    sns.histplot(frames_info, bins=20, kde=True, color='skyblue')
+    plt.title('Заполненность Ethernet-кадров (в процентах)')
+    plt.xlabel('Процент заполненности кадра')
+    plt.ylabel('Частота')
+    plt.tight_layout()
+    plt.savefig('frame_fill_percentage_histogram.png')
+    plt.close()
+    print("Гистограмма сохранена как 'frame_fill_percentage_histogram.png'.")
+
+
 def main():
     # Настройка базовой конфигурации логирования
     logging.basicConfig(
@@ -490,14 +706,21 @@ def main():
 
     # Количество процессоров в системе (исключая центральный)
     amount_of_processors = 2
-    rtos = MultiprocessorRTOS(amount_of_processors)  # Создаём экземпляр RTOS с заданной конфигурацией процессоров
+    ddr_size = 128000000000
+    rtos = MultiprocessorRTOS(amount_of_processors, ddr_size)  # Создаём экземпляр RTOS с заданной конфигурацией процессоров
     tasks = generate_ieee_802_3ba_tasks()  # Генерируем список задач
     for task in tasks:
         rtos.add_task(task)  # Добавляем каждую задачу в очередь RTOS
 
+
+
     rtos.process_tasks(total_simulation_time=60)  # Запускаем обработку задач на total_simulation_time секунд
 
     task_report = rtos.generate_task_report()  # Получаем отчёт о выполненных задачах
+
+
+
+
 
     print("Отчет о выполнении задач:")
     headers = [
@@ -577,3 +800,8 @@ def main():
     generate_task_state_pie_chart(df_filtered)
     generate_processor_task_distribution(df_filtered)
     generate_core_task_distribution(df_filtered)
+    generate_processor_task_distribution_with_types(df_filtered)
+    # Строим гистограмму заполненности кадров
+    frames_info = process_tasks_for_frames(df_filtered)
+    # Строим гистограмму заполненности кадров
+    generate_fill_percentage_histogram(frames_info)

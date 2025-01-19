@@ -14,7 +14,10 @@ from riscv_rtos import (
     generate_execution_time_distribution,
     generate_task_state_pie_chart,
     generate_processor_task_distribution,
-    generate_core_task_distribution
+    generate_core_task_distribution,
+    generate_fill_percentage_histogram,
+    process_tasks_for_frames,
+    generate_processor_task_distribution_with_types
 )
 
 ###############################################################################
@@ -109,6 +112,11 @@ class RTOSGUI(tk.Tk):
         ttk.Label(frame_settings, text="Количество процессоров:").grid(row=0, column=0, padx=5, pady=2, sticky="e")
         ttk.Entry(frame_settings, textvariable=self.num_processors_var, width=5).grid(row=0, column=1, padx=5, pady=2, sticky="w")
 
+        ttk.Label(frame_settings, text="Объем ОЗУ (байт):").grid(row=2, column=0, padx=5, pady=2, sticky="e")
+        self.ddr_size_var = tk.IntVar(value=128000000000)  # начальное значение
+        ttk.Entry(frame_settings, textvariable=self.ddr_size_var, width=20).grid(row=2, column=1, padx=5, pady=2,
+                                                                                 sticky="w")
+
         ttk.Label(frame_settings, text="Время симуляции (сек):").grid(row=1, column=0, padx=5, pady=2, sticky="e")
         ttk.Entry(frame_settings, textvariable=self.sim_time_var, width=5).grid(row=1, column=1, padx=5, pady=2, sticky="w")
 
@@ -120,10 +128,10 @@ class RTOSGUI(tk.Tk):
         ttk.Entry(frame_random, textvariable=self.random_count_var, width=5).grid(row=0, column=1, padx=5, pady=2, sticky="w")
 
         ttk.Label(frame_random, text="Min Size (бит):").grid(row=1, column=0, padx=5, pady=2, sticky="e")
-        ttk.Entry(frame_random, textvariable=self.random_min_data_size_var, width=5).grid(row=1, column=1, padx=5, pady=2, sticky="w")
+        ttk.Entry(frame_random, textvariable=self.random_min_data_size_var, width=15).grid(row=1, column=1, padx=5, pady=2, sticky="w")
 
         ttk.Label(frame_random, text="Max Size (бит):").grid(row=2, column=0, padx=5, pady=2, sticky="e")
-        ttk.Entry(frame_random, textvariable=self.random_max_data_size_var, width=5).grid(row=2, column=1, padx=5, pady=2, sticky="w")
+        ttk.Entry(frame_random, textvariable=self.random_max_data_size_var, width=15).grid(row=2, column=1, padx=5, pady=2, sticky="w")
 
         ttk.Button(frame_random, text="Добавить рандомные задачи", command=self.add_random_tasks).grid(
             row=0, column=2, rowspan=3, padx=10, pady=2, sticky="ns"
@@ -311,7 +319,8 @@ class RTOSGUI(tk.Tk):
 
         # Создаём RTOS
         num_proc = self.num_processors_var.get()
-        self.rtos = MultiprocessorRTOS(num_proc)
+        ddr_size = self.ddr_size_var.get()
+        self.rtos = MultiprocessorRTOS(num_proc, ddr_size= ddr_size)
 
         # Добавляем задачи
         for t in self.custom_tasks:
@@ -392,27 +401,26 @@ class RTOSGUI(tk.Tk):
             logging.error(f"Не удалось сохранить Excel: {e}")
 
     def generate_charts(self):
-        """
-        Генерируем 4 графика: Priority, Exec Time, Task State Pie, Processor Distribution
-        """
+
         if self.task_report_df is None or self.task_report_df.empty:
             messagebox.showinfo("Нет данных", "Сначала запустите симуляцию, чтобы получить отчёт.")
             return
 
         df_filtered = self.rename_columns_for_report(self.task_report_df)
+        frames_info = process_tasks_for_frames(df_filtered)
         generate_priority_distribution(df_filtered)
         generate_execution_time_distribution(df_filtered)
         generate_task_state_pie_chart(df_filtered)
         generate_processor_task_distribution(df_filtered)
         generate_core_task_distribution(df_filtered)
+        generate_fill_percentage_histogram(frames_info)
+        generate_processor_task_distribution_with_types(df_filtered)
 
 
         logging.info("Графики сохранены в виде PNG-файлов.")
 
     def rename_columns_for_report(self, df):
-        """
-        Переименовываем столбцы под русские названия (как в исходном коде).
-        """
+
         df_copy = df.copy()
         rename_map = {
             "task_id": "Задача ID",
@@ -434,7 +442,7 @@ class RTOSGUI(tk.Tk):
 
 def main():
     app = RTOSGUI()
-    app.geometry("1000x800")  # Можно указать стартовый размер
+    app.geometry("1000x800")
     app.mainloop()
 
 if __name__ == "__main__":
